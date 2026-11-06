@@ -1,7 +1,7 @@
 # background
 
-Puts a slow animated plasma, or a picture, behind the text in your terminal
-while you keep working. It runs as an ordinary background job, so there's no
+Puts a slow animated plasma, marbled swirls that hold still, or a picture,
+behind the text in your terminal while you keep working. It runs as an ordinary background job, so there's no
 terminal config to change, and it works over SSH.
 
 It needs a terminal that supports the
@@ -38,13 +38,19 @@ the way out.
 ## Options
 
 ```
---color COLOR   plasma color: rainbow (the default), red, orange, yellow, green,
-                teal, blue, purple, pink, or a hex color like ff8800
+--still         marbled swirls that hold still instead of the moving plasma;
+                a new one each run
+--seed N        with --still: which one to draw; the same number draws the
+                same one (default: random, and printed so you can get it back)
+--color COLOR   color for the plasma or --still: rainbow (the default), red,
+                orange, yellow, green, teal, blue, purple, pink, or a hex color
+                like ff8800
 --image PATH    show a picture instead of the plasma
 --opacity N     1 is solid; lower fades it into your terminal's background
                 (default 0.25)
 --tty DEVICE    draw on another terminal; run `tty` there to get its name
---fps N         redraw rate (default 8 for the plasma, 4 for a picture)
+--fps N         redraw rate (default 8 for the plasma, 4 for a picture or
+                --still)
 ```
 
 For example:
@@ -52,12 +58,30 @@ For example:
 ```sh
 ./background.py --color teal &
 ./background.py --color ff8800 --opacity 0.4 &
+./background.py --still &
+./background.py --still --seed 202 --color purple &
 ./background.py --image ~/Pictures/beach.jpg &
 ```
 
 Fading uses transparency rather than darkening, so it works on light and dark
 themes alike. A picture is cropped to fill the window and is never sent larger
 than 1280 pixels wide.
+
+## The still
+
+`--still` draws its swirls once, when it starts. It's for when you'd like the
+plasma's look without the motion.
+
+The swirls come from warping noise with noise. Each pixel reads a smooth random
+field (the "ink") at a spot pushed sideways by two more fields, and those were
+read at pushed spots too. The fields that do the pushing are very smooth, so
+the ink folds and streaks like ink stirred into water rather than breaking up.
+It takes about a fifth of a second.
+
+Each run draws a new one and prints its number, like
+`background: still 50750 (--seed 50750 draws it again)`. With rainbow, the
+number picks the colors too. Pass `--seed` and nothing is printed, so it's
+quiet enough to start from your shell's startup file.
 
 ## How it works
 
@@ -76,8 +100,9 @@ Drawing from a background job takes some care:
 - Each frame goes out in a single write, and saves and restores the cursor
   around itself, so the cursor you're typing at never moves.
 - The plasma is a tiny image (96 pixels wide) that the terminal stretches and
-  smooths. That keeps it to about 70 KB/s. A picture is sent once, and after
-  that each update is about 60 bytes.
+  smooths. That keeps it to about 70 KB/s. A picture or a still is sent once,
+  and after that each update is about 60 bytes. It is sent again every 20
+  seconds, which brings it back after `reset` and inside full-screen apps.
 
 ## Limitations
 
@@ -90,8 +115,8 @@ Drawing from a background job takes some care:
 - **Saved cursor position:** each frame saves and restores the cursor. Some
   programs (a few progress bars, for example) save and restore it too, and if a
   frame lands in between, that program can end up drawing in the wrong place.
-- **Full-screen apps:** inside vim, less and the like, a picture can take up to
-  20 seconds to appear. They use a separate screen, which has its own images.
+- **Full-screen apps:** inside vim, less and the like, a picture or a still can
+  take up to 20 seconds to appear. They use a separate screen, which has its own images.
 - **One at a time:** two copies on the same terminal fight over the same image.
 
 ## Check

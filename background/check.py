@@ -142,6 +142,8 @@ def main():
             check_mode("plasma --color teal", "--color", "teal", "--opacity", "0.5"),
             check_mode("plasma --color ff8800", "--color", "ff8800"),
             check_mode("--image, with a resize", "--image", str(picture), resize=True),
+            check_mode("--still, with a resize", "--still", "--seed", "7", resize=True),
+            check_mode("--still --color teal", "--still", "--color", "teal"),
             check_terminal_closes(),
         ]
     sys.exit(0 if all(results) else 1)

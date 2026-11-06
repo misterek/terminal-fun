@@ -7,6 +7,8 @@
 
   ./background.py &                     a slow animated plasma behind your text
   ./background.py --color teal &        ...kept to one color family
+  ./background.py --still &             marbled swirls that hold still (a new one each run)
+  ./background.py --still --seed 42 &   ...the same one every time
   ./background.py --image pic.jpg &     a picture behind your text
   ./background.py --opacity 0.4 ...     stronger (1 is solid; the default is 0.25)
   ./background.py --tty /dev/pts/3 &    draw on another terminal (run `tty` there)
@@ -36,6 +38,7 @@ import errno
 import fcntl
 import io
 import os
+import random
 import re
 import signal
 import struct
@@ -146,8 +149,56 @@ class Plasma:
         return at(0, 0, body)
 
 
+def smooth_noise(rng, h, w, falloff):
+    """A smooth random field that wraps at the edges, roughly -1 to 1: random waves
+    whose strength falls off with frequency (as 1/f^falloff), summed by an inverse FFT."""
+    fy, fx = np.meshgrid(np.fft.fftfreq(h), np.fft.rfftfreq(w), indexing="ij")
+    f = np.hypot(fx, fy)
+    f[0, 0] = np.inf  # no constant term
+    waves = (rng.standard_normal(f.shape) + 1j * rng.standard_normal(f.shape)) / f ** falloff
+    field = np.fft.irfft2(waves, s=(h, w))
+    return field / (3 * field.std())
+
+
+def lookup(field, x, y):
+    """Read field at fractional pixel positions (bilinear, wrapping at the edges)."""
+    h, w = field.shape
+    x0, y0 = np.floor(x), np.floor(y)
+    fx, fy = x - x0, y - y0
+    x0, y0 = x0.astype(int) % w, y0.astype(int) % h
+    x1, y1 = (x0 + 1) % w, (y0 + 1) % h
+    top = field[y0, x0] * (1 - fx) + field[y0, x1] * fx
+    bottom = field[y1, x0] * (1 - fx) + field[y1, x1] * fx
+    return top * (1 - fy) + bottom * fy
+
+
+def still(seed, hue, saturation, size=(1280, 800)):
+    """Marbled swirls that hold still, made by warping noise with noise, twice.
+
+    Every pixel looks up a noise field ("the ink") at a spot pushed sideways by other
+    noise fields, which were themselves read at pushed spots. Very smooth fields do
+    the pushing, so the ink folds and streaks like ink in water instead of crumbling.
+    The same seed always draws the same swirls. Rainbow's hue is None: then the seed
+    also picks the colors.
+    """
+    w, h = size
+    rng = np.random.default_rng(seed)
+    ax, ay, bx, by = (smooth_noise(rng, h, w, 3.2) for _ in range(4))  # the pushers
+    ink = smooth_noise(rng, h, w, 2.0)
+    y, x = np.mgrid[0:h, 0:w]
+    push = 0.55 * w
+    px, py = x + push * ax, y + push * ay
+    qx, qy = lookup(bx, px, py), lookup(by, px, py)
+    v = np.tanh(2 * lookup(ink, x + push * qx, y + push * qy))  # more contrast, still -1 to 1
+    if hue is None:
+        hue = rng.random() + 0.18 * np.clip(qx + ay, -1, 1)  # spread around a random hue
+    rgb = hsv_to_rgb(hue + 0.05 * v, saturation, 0.75 + 0.25 * v)
+    return Image.fromarray((rgb * 255).astype(np.uint8), "RGB")
+
+
 class Picture:
-    """A picture behind your text, cropped to fill the window and faded with alpha.
+    """A picture (or a generated still) behind your text, cropped to fill the window
+    and faded with alpha.
 
     The pixels go over the wire once. An invisible "virtual" placement (U=1, normally
     used for Unicode-placeholder images) keeps them alive: Ghostty's `clear` deletes
@@ -159,8 +210,8 @@ class Picture:
     max_width = 1280     # more pixels than this just costs bandwidth behind faded text
     resend_every = 20.0  # seconds; recovers after `reset`, and inside vim/less (alt screen)
 
-    def __init__(self, path, opacity):
-        img = ImageOps.exif_transpose(Image.open(path)).convert("RGBA")
+    def __init__(self, img, opacity):
+        img = img.convert("RGBA")
         img.thumbnail((2 * self.max_width, 2 * self.max_width), Image.Resampling.LANCZOS)
         img.putalpha(img.getchannel("A").point(lambda a: round(a * opacity)))
         self.img = img
@@ -209,10 +260,16 @@ def parse_color(text):
 def main():
     ap = argparse.ArgumentParser(prog="background.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--still", action="store_true",
+                    help="marbled swirls that hold still instead of the moving plasma; "
+                         "a new one each run")
+    ap.add_argument("--seed", type=int, metavar="N",
+                    help="with --still: which one to draw; the same number draws the same "
+                         "one (default: random, and printed so you can get it back)")
     ap.add_argument("--image", metavar="PATH", help="show a picture instead of the plasma")
     ap.add_argument("--color", type=parse_color, metavar="COLOR",
-                    help=f"plasma color: {', '.join(COLORS)}, or a hex color like ff8800 "
-                         "(default: rainbow)")
+                    help=f"color for the plasma or --still: {', '.join(COLORS)}, or a hex "
+                         "color like ff8800 (default: rainbow)")
     ap.add_argument("--opacity", type=float, default=0.25,
                     help="1 is solid; lower fades it into your terminal's background "
                          "(default: 0.25)")
@@ -220,13 +277,21 @@ def main():
                     help="terminal to draw on (default: this one; run `tty` in another "
                          "terminal to get its name)")
     ap.add_argument("--fps", type=float,
-                    help="redraw rate (default: 8 for the plasma, 4 for a picture)")
+                    help="redraw rate (default: 8 for the plasma, 4 for a picture or --still)")
     args = ap.parse_args()
+    if args.image and args.still:
+        ap.error("pick one of --image and --still")
     if args.image and args.color:
-        ap.error("--color is for the plasma; it doesn't apply to --image")
+        ap.error("--color is for the plasma and --still; it doesn't apply to --image")
+    if args.seed is not None and not args.still:
+        ap.error("--seed goes with --still")
     if args.fps is not None and args.fps <= 0:
         ap.error("--fps must be more than 0")
     opacity = max(0.0, min(1.0, args.opacity))
+
+    # With `stty tostop`, a background job writing to its terminal gets SIGTTOU and
+    # stops. If the signal is ignored, the kernel lets the write through instead.
+    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
 
     path = args.tty
     if not path:
@@ -240,20 +305,24 @@ def main():
     except OSError as e:
         sys.exit(f"background: can't open {path}: {e.strerror}")
 
+    hue, saturation = args.color or parse_color("rainbow")
     if args.image:
         try:
-            mode = Picture(args.image, opacity)
+            mode = Picture(ImageOps.exif_transpose(Image.open(args.image)), opacity)
         except OSError as e:
             sys.exit(f"background: can't open {args.image}: {e}")
         interval = 1 / (args.fps or 4)
+    elif args.still:
+        seed = args.seed
+        if seed is None:
+            seed = random.randrange(100000)
+            print(f"background: still {seed} (--seed {seed} draws it again)", file=sys.stderr)
+        mode = Picture(still(seed, hue, saturation), opacity)
+        interval = 1 / (args.fps or 4)
     else:
-        hue, saturation = args.color or parse_color("rainbow")
         mode = Plasma(hue, saturation, opacity)
         interval = 1 / (args.fps or 8)
 
-    # With `stty tostop`, a background job writing to its terminal gets SIGTTOU and
-    # stops. If the signal is ignored, the kernel lets the write through instead.
-    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
     stopping = []
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, lambda *_: stopping.append(True))
