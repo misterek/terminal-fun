@@ -4,7 +4,7 @@ I recently found out that ghostty supports Kitty Graphics now.  So these are fun
 
 This may grow to a bunch of random crap. Some useful.  Some not.  Most not, probably.
 
-This will be pretty much all AI generated, so, take that for what you will. I'm mostly just playing around here.
+This will be pretty much all AI generated, so, take that for what you will. I'm mostly just playing around here.  Also, I'm sorry for the long AI output. I'll try to find time to edit it in my own voice.
 
 IMPORTANT:  You can run these from your terminal directly from GitHub, but for the love of god, ALWAYS pin to a sha.  I can't give you the exact commands in the examples, since, you know, it changes when I commit it. But, you can figure that out for yourself.
 
