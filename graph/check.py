@@ -221,6 +221,9 @@ def check_detach():
     listed = graph("--list").stdout
     if gid and gid not in listed:
         found.append(f"--list doesn't show it: {listed!r}")
+    leftovers = list(Path(os.environ["XDG_RUNTIME_DIR"]).glob("terminal-fun-graph-*/seed-*"))
+    if leftovers:
+        found.append(f"left the data it handed over behind: {leftovers}")
     stopped = graph("--stop", gid or "all")
     if stopped.returncode != 0:
         found.append(f"--stop failed: {(stopped.stdout + stopped.stderr)[-300:]}")
@@ -273,16 +276,25 @@ def check_replaces():
 
 
 def check_bad_source():
+    """A replacement whose source fails its check doesn't start, and leaves the graph
+    that was already in that corner alone."""
     master, slave = fake_terminal()
-    r = graph("--cmd", "echo oops >&2; exit 1", "--detach", "--tty", os.ttyname(slave))
+    reader = Reader(master)
+    path = os.ttyname(slave)
+    first = detached_id(graph("--cmd", "echo 1", "--title", "First", "--detach", "--tty", path))
+    r = graph("--cmd", "echo oops >&2; exit 1", "--detach", "--tty", path)
     found = []
     if r.returncode == 0:
         found.append("started anyway")
     if "oops" not in r.stderr:
         found.append(f"didn't say what went wrong: {r.stderr.strip()!r}")
-    if "nothing showing" not in graph("--list").stdout:
-        found.append("left a graph running")
-        graph("--stop", "all")
+    listed = graph("--list").stdout
+    if not first or first not in listed:
+        found.append(f"the graph that was already there got stopped: {listed!r}")
+    elif len(listed.splitlines()) != 1:
+        found.append(f"left an extra graph running: {listed!r}")
+    graph("--stop", "all")
+    reader.stop()
     os.close(master)
     os.close(slave)
     return report("--detach, broken source", found)
@@ -402,7 +414,9 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["XDG_RUNTIME_DIR"] = tmp  # a private list of running graphs
         results = [
-            check_live("--cmd", "--cmd", "echo 4.2", "--unit", "ms"),
+            # want: the hidden placement that keeps the picture alive through `clear`
+            check_live("--cmd", "--cmd", "echo 4.2", "--unit", "ms",
+                       want=rb"a=p,U=1,i=\d+,p=2,"),
             check_live("--cmd, two series", "--cmd", "printf 'api 3\\nweb 7\\n'",
                        "--at", "bottom-left", "--size", "40x10"),
             check_live("--stdin", "--stdin", stdin_data=b"1\n2\n3\n"),

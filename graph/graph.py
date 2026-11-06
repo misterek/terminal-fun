@@ -329,6 +329,25 @@ class Store:
         with self.lock:
             self.ended = True
 
+    def load(self, path):
+        """Start from what the --detach that started this copy already fetched, so the
+        graph has its line from the first picture, not after a slow first fetch."""
+        try:
+            with open(path) as f:
+                saved = json.load(f)
+            os.remove(path)
+            series = {k: deque((t, v) for t, v in pts) for k, pts in saved["series"].items()}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return
+        with self.lock:
+            self._note(saved.get("order") or list(series))
+            self.series, self.updated = series, saved.get("updated")
+
+    def save(self, path):
+        series, order, _, updated, _ = self.snapshot()
+        with open(path, "w") as f:
+            json.dump({"series": series, "order": order, "updated": updated}, f)
+
     def snapshot(self):
         with self.lock:
             return ({k: list(v) for k, v in self.series.items()}, list(self.order),
@@ -445,11 +464,14 @@ class McpClient:
     command we start, or over HTTP when it's a URL.
 
     A command gets our environment, so the usual GRAFANA_URL and token variables reach
-    it. A URL gets $GRAFANA_MCP_TOKEN as a bearer token, if that's set. After anything
-    goes wrong, the next call starts over with a fresh server or session.
+    it. A URL gets $GRAFANA_MCP_TOKEN as a bearer token, if that's set. The server (or
+    session) is started once and kept for every call after; only after something goes
+    wrong does the next call start a fresh one.
     """
 
-    timeout = 30  # seconds for any one answer, starting the server included
+    timeout = 30          # seconds for a tool call to answer
+    start_timeout = 120   # seconds to start the server: uvx, npx and docker can be slow,
+                          # the first time especially
 
     def __init__(self, target):
         self.url = target if re.match(r"https?://", target) else None
@@ -462,21 +484,11 @@ class McpClient:
 
     def call(self, tool, args):
         """Call a tool and return what it said, decoded from JSON."""
-        # A server that never answers is killed, which ends the wait with an error.
-        timer = threading.Timer(self.timeout, self.close)
-        timer.start()
-        try:
-            proc = self.proc
-            if not self.ready or (self.argv and proc.poll() is not None):
-                proc = self._connect()
-            result = self._request(proc, "tools/call", {"name": tool, "arguments": args})
-        except (OSError, ValueError, RuntimeError) as e:
-            self.close()
-            if not timer.is_alive():
-                raise RuntimeError(f"no answer from the MCP server in {self.timeout}s") from None
-            raise RuntimeError(str(e)) from None
-        finally:
-            timer.cancel()
+        proc = self.proc
+        if not self.ready or (self.argv and proc.poll() is not None):
+            proc = self._within(self.start_timeout, self._connect)
+        result = self._within(self.timeout, self._request, proc, "tools/call",
+                              {"name": tool, "arguments": args})
         text = "".join(c.get("text", "") for c in result.get("content", [])
                        if c.get("type") == "text")
         if result.get("isError"):
@@ -487,6 +499,22 @@ class McpClient:
             return json.loads(text)
         except ValueError:
             raise RuntimeError(f"{tool} didn't return JSON: {text[:200]}") from None
+
+    def _within(self, seconds, fn, *args):
+        """fn(*args), but a server that hasn't answered in `seconds` is killed, which ends
+        the wait with an error. After any error, the next call starts a fresh server."""
+        expired = []
+        timer = threading.Timer(seconds, lambda: (expired.append(True), self.close()))
+        timer.start()
+        try:
+            return fn(*args)
+        except (OSError, ValueError, RuntimeError) as e:
+            self.close()
+            if expired:
+                raise RuntimeError(f"no answer from the MCP server in {seconds}s") from None
+            raise RuntimeError(str(e)) from None
+        finally:
+            timer.cancel()
 
     def close(self):
         self.ready, self.session = False, None
@@ -966,6 +994,13 @@ class Panel:
         return self.chart.render(round(c * cw * k), round(r * ch * k), ch * k,
                                  self.store.snapshot(), now)
 
+    def first_frame(self, size):
+        """Draw the first picture now, so a graph that replaces another one shows up the
+        moment the old one goes."""
+        self._size = size
+        self.frame = (0, png(self.render(*size, time.time())))
+        self._drawn = (int(time.time()), size)  # so the thread doesn't draw it again
+
     def start_drawing(self, stop):
         """Draw in a thread of its own. Drawing takes a tenth of a second or so, and
         re-pinning mustn't wait for it, or the graph rides along with any text that
@@ -973,7 +1008,7 @@ class Panel:
         threading.Thread(target=self._draw, args=(stop,), daemon=True).start()
 
     def _draw(self, stop):
-        drawn, number, complained = None, 0, False
+        drawn, number, complained = getattr(self, "_drawn", None), 0, False
         while not stop.is_set():
             size = self._size
             # A new second (or a resize): fresh pixels, so the time axis slides along.
@@ -995,7 +1030,12 @@ class Panel:
         frame = self.frame
         if frame and frame[0] != self._sent:
             self._sent = frame[0]
-            body = chunked(f"a=T,f=100,{keys}", frame[1])
+            # Plus a hidden second placement (U=1, a "virtual" one, shown only where
+            # special placeholder characters are, so never here). `clear` and full-screen
+            # redraws delete the visible placement and free any picture nothing else
+            # refers to; this keeps ours, so the next re-pin brings it straight back.
+            body = (chunked(f"a=T,f=100,{keys}", frame[1])
+                    + apc(f"a=p,U=1,i={self.image_id},p=2,c={c},r={r},q=2"))
         else:
             # Same pixels: re-pin placement 1 so scrolling can't carry it off.
             body = apc(f"a=p,{keys}")
@@ -1046,22 +1086,29 @@ def make_source(args, every, step):
     return None, "stdin"
 
 
-def detach(path, lifetime):
+def detach(path, lifetime, store):
     """Start a copy of ourselves drawing in the background, in a session of its own with
-    no stdin or stdout, so whatever ran us gets its prompt back. Returns its pid once it
-    has registered, so --list and --stop see it straight away."""
+    no stdin or stdout, so whatever ran us gets its prompt back. It starts from the data
+    in `store`. Returns its pid once it has registered, so --list and --stop see it
+    straight away."""
+    seed = os.path.join(state_dir(), f"seed-{os.getpid()}.json")
+    store.save(seed)
     argv = [a for a in sys.argv[1:] if a != "--detach"]
     log_path = os.path.join(state_dir(), "detached.log")
     with open(log_path, "a") as log:
         child = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), *argv, "--tty", path,
-             "--for", str(lifetime)],
+             "--for", str(lifetime), "--seed", seed],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log,
             start_new_session=True)
     registered = os.path.join(state_dir(), f"{child.pid}.json")
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + 30
     while not os.path.exists(registered):
         if child.poll() is not None or time.monotonic() > deadline:
+            try:
+                os.remove(seed)
+            except OSError:
+                pass
             try:
                 with open(log_path) as f:
                     tail = f.read().strip().splitlines()[-1:]
@@ -1123,6 +1170,7 @@ def main():
                     help="check the source once, start drawing in the background, print "
                          "the id and return")
     ap.add_argument("--list", action="store_true", help="list the graphs that are showing")
+    ap.add_argument("--seed", help=argparse.SUPPRESS)  # from --detach: data to start from
     ap.add_argument("--stop", metavar="ID",
                     help="stop a graph: an id from --list, a corner of this terminal, or all")
     args = ap.parse_args()
@@ -1160,6 +1208,8 @@ def main():
     if len(title) > 48:
         title = title[:47] + "…"
     store = Store(args.window)
+    if args.seed:
+        store.load(args.seed)
     stop = threading.Event()
     try:
         source, note = make_source(args, every, step)
@@ -1205,9 +1255,6 @@ def main():
     except OSError as e:
         sys.exit(f"graph: can't open {path}: {e.strerror}")
 
-    # One graph per corner of a terminal: this one replaces whatever is there.
-    stop_graphs([g for g in running() if g["tty"] == path and g["at"] == args.at])
-
     if args.detach:
         try:
             source(store)  # fail now, while someone is around to read why
@@ -1215,11 +1262,18 @@ def main():
             sys.exit(f"graph: {e}")
         finally:
             close(source)
-        pid = detach(path, lifetime)
+        pid = detach(path, lifetime, store)
         print(f"graph: showing {title!r} at the {args.at} of {path} "
               f"{'for ' + human(lifetime) if lifetime else 'until stopped'} (id {pid})")
         print(f"graph: stop it with: {os.path.basename(__file__)} --stop {pid}")
         return
+
+    # One graph per place on a terminal: this one replaces whatever is there, but only
+    # now that its first picture is ready, so the gap is as short as can be. (With
+    # --detach this happens in the copy, after the source checked out: a check that
+    # fails leaves the old graph alone.)
+    panel.first_frame(tty.size())
+    stop_graphs([g for g in running() if g["tty"] == path and g["at"] == args.at])
 
     # With `stty tostop`, a background job writing to its terminal gets SIGTTOU and
     # stops. If the signal is ignored, the kernel lets the write through instead.

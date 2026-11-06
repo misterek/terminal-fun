@@ -63,7 +63,9 @@ variable.
   like `--mcp "uvx mcp-grafana"`, which then gets the same `GRAFANA_URL` and token
   variables, or its URL, like `--mcp https://mcp.example.com/mcp`, with
   `$GRAFANA_MCP_TOKEN` if it needs a token. It uses the server's `list_datasources` and
-  `query_prometheus` tools.
+  `query_prometheus` tools. The server is started once and kept for every update after
+  that, and only replaced after something goes wrong. It gets 2 minutes to start (uvx,
+  npx and docker can be slow, the first time especially), and each query gets 30 seconds.
 - **Prometheus directly** (or VictoriaMetrics, and the like): `--prom URL`, with
   `$PROM_TOKEN` if it needs one.
 
@@ -110,8 +112,12 @@ through apps that paint their own backgrounds, like vim and htop.
 where the agent can read the error. Then it starts the graph in the background. It
 finds the terminal by walking up the processes that started it, to the first one that
 has a terminal: Claude Code itself. A detached graph goes away after 30 minutes unless
-`--for` says otherwise (`--for 0` keeps it until it's stopped). A new graph in the same
-corner of the same terminal replaces the old one.
+`--for` says otherwise (`--for 0` keeps it until it's stopped).
+
+A new graph in the same corner of the same terminal replaces the old one. The old one
+stays up until the new one is ready to draw. If the new one's source fails its check,
+the old one isn't touched. The background copy starts with the data that check
+fetched, so even with a slow source, the line is there from the first picture.
 
 `--snapshot` also prints how many series and points it got, or the error, so an agent
 can tell without opening the picture.
@@ -177,8 +183,14 @@ the text (the panel is 93% opaque). Once a second it sends fresh pixels, so the 
 axis slides along. In between, forty times a second, it re-pins the image to its
 corner. The drawing happens in a thread of its own, so the re-pinning never waits
 for it. Images in that protocol are pinned to cells, not to the window, so they scroll
-away with your output, and `clear` deletes them. Re-pinning brings the graph back
-within a moment.
+away with your output. Re-pinning brings the graph back within a moment.
+
+`clear`, and full-screen redraws like the ones Claude Code sometimes does, delete what's
+on the screen. They also free any image that nothing refers to anymore. So along with
+each picture, it adds a hidden "virtual" placement (`U=1`), the same trick background
+uses. That placement is only shown where special placeholder characters appear in the
+text, so it's never seen, but it keeps the picture alive. The next re-pin then brings
+the graph straight back instead of waiting up to a second for a fresh picture.
 
 It follows the same rules as background for drawing from a background job: it never
 reads from the terminal, every command asks the terminal not to reply (`q=2`), and
