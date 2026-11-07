@@ -1,14 +1,14 @@
 ---
 name: terminal-graph
-description: Put a live line graph over a corner of the user's terminal (Ghostty or kitty), fed by a PromQL query (through Grafana, a Grafana MCP server, or Prometheus) or by any shell command that prints a number. Use when the user wants to see, graph, chart, plot, watch or keep an eye on a metric or a number over time while they work, or wants such a graph taken down.
+description: Put a live line graph, or a live table, over a corner of the user's terminal (Ghostty or kitty), fed by a PromQL query (through Grafana, a Grafana MCP server, or Prometheus) or by any shell command. Use when the user wants to see, graph, chart, plot, watch or keep an eye on a metric or a number over time while they work, or wants to watch a list or a status (pods, containers, hosts, the busiest of something) as it changes, or wants one taken down.
 ---
 
 # Terminal graph
 
-`graph.py`, in this skill's base directory, draws a live line graph over a corner of the
-terminal Claude Code is running in, and keeps it updating while the user works. Run it
-by its full path (below, `graph.py` means that path). It needs `uv`, or `python3` with
-numpy and Pillow.
+`graph.py`, in this skill's base directory, draws a live line graph or a live table over
+a corner of the terminal Claude Code is running in, and keeps it updating while the user
+works. Run it by its full path (below, `graph.py` means that path). It needs `uv`, or
+`python3` with numpy and Pillow.
 
 ## Put one up
 
@@ -35,11 +35,21 @@ Pick a source:
     or `--mcp https://...` (with `$GRAFANA_MCP_TOKEN` if it needs one)
   - Prometheus directly: `--prom URL`
 
-  If none is set up, ask the user how to reach their Grafana. `claude mcp get <name>`
-  shows how Claude Code starts its own Grafana MCP server, which is usually the right
-  `--mcp` command. Don't copy tokens out of config files into a command line. If a
-  token isn't in the environment, ask the user to export it. If you have Grafana tools
-  of your own, use them first to find the right metric and check the query returns data.
+  If none is set up, but Grafana's `gcx` CLI is installed and logged in (`gcx config
+  check` says so), go through it with `--cmd`. Its token stays in its own config:
+
+  ```sh
+  graph.py --detach --title "Load" --every 30s \
+    --cmd 'gcx metrics query "node_load1" --from $GRAPH_START --to $GRAPH_END --step ${GRAPH_STEP}s -o json'
+  ```
+
+  Keep the `--cmd` in single quotes, so graph.py's shell fills in `$GRAPH_START` and
+  the rest on each fetch. If gcx isn't there either, ask the user how to reach their
+  Grafana. `claude mcp get <name>` shows how Claude Code starts its own Grafana MCP
+  server, which is usually the right `--mcp` command. Don't copy tokens out of config
+  files into a command line. If a token isn't in the environment, ask the user to
+  export it. If you have Grafana tools of your own, use them first to find the right
+  metric and check the query returns data.
 - **`--stdin`** is for the user's own pipelines. It can't `--detach`.
 
 Always give a short `--title`, and a `--unit` when there is one. Also handy:
@@ -49,13 +59,37 @@ Always give a short `--title`, and a `--unit` when there is one. Also handy:
 behind their text instead of over it, add `--behind` (faded; `--opacity` to taste).
 It stays in its corner; use `--at fill` (the whole window) only if they ask for that.
 
+## A table instead
+
+When the user wants to watch a list or a status rather than a number over time
+(pods, containers, which hosts are down, the busiest namespaces), add `--table`:
+
+```sh
+graph.py --detach --table --title "Pods" --cmd "kubectl get pods"
+graph.py --detach --table --title "Waiting containers" \
+  --promql 'kube_pod_container_status_waiting_reason == 1'
+```
+
+- `--cmd` prints text in columns under a header, the way kubectl and docker do, or
+  JSON: a list of objects, or one object per line. Run it once by itself first. If its
+  columns don't line up (macOS `ps aux` doesn't), ask for fewer columns or use JSON.
+  It runs every 5 seconds.
+- `--promql` is an instant query: a row per series, with the labels that tell them
+  apart and the value. Use `sort_desc()` or `topk()` for the biggest first. Through
+  gcx, use `gcx metrics query "..." -o json` with no times: that's an instant query too.
+- `--columns NAME,STATUS` picks columns and their order. `--behind` doesn't go with a
+  table.
+- The table sizes itself, up to 80x20 cells. A cell that changes lights up blue and
+  fades, and a row that goes away stays a few seconds, struck through. Say so when you
+  tell the user what you put up.
+
 ## After
 
 - Tell the user what you put up, where, and its id. It goes away by itself after 30
   minutes. Use `--for 2h` for longer, or `--for 0` to keep it until it's stopped, but
   only if they ask.
-- There's one graph per corner: a new one in the same corner replaces the old one. For
-  several at once, use different corners. The top two are best, because the bottom
+- There's one graph or table per corner: a new one in the same corner replaces the old
+  one. For several at once, use different corners. The top two are best, because the bottom
   ones can cover Claude Code's input box.
 - `graph.py --list` shows what's up. `graph.py --stop ID` takes one down (or a corner
   name, or `all`).
@@ -63,7 +97,8 @@ It stays in its corner; use `--at fill` (the whole window) only if they ask for 
 ## Look first, or show it somewhere else
 
 `graph.py --snapshot /tmp/graph.png` with the same source flags, and no `--detach`,
-draws one frame to a file. It prints how many series and points it got, or the error.
+draws one frame to a file. It prints how many series and points it got (rows and
+columns, for a table), or the error.
 Read the PNG to see the graph. The user may be following along from another device
 (Remote Control, the web, a phone), and the live graph only shows on the computer's
 terminal. Send them the snapshot too.

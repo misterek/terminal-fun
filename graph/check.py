@@ -10,12 +10,15 @@ have showing are left alone.
     ./check.py        (or: uv run check.py)
 
 It checks that every command is quiet (q=2, so nothing gets typed at your prompt),
-that the cursor is always put back, and that the image is deleted on exit. Then that
+that the cursor is always put back, and that the image is deleted on exit; that a
+picture goes over in a file, and a terminal that leaves the files alone gets the
+pixels instead. Then that
 --detach starts a graph and returns, finds the terminal on its own, replaces a graph
 in the same corner, and reports a broken source instead of starting; that --list and
---stop work; that --snapshot writes a picture; that --promql works through a Grafana
-MCP server, both one it starts and one at a URL (a stand-in for each); and that the
-script exits quietly when its terminal closes.
+--stop work; that --snapshot writes a picture; that --table reads text in columns and
+JSON; that --promql works through a Grafana MCP server, both one it starts and one at a
+URL (a stand-in for each), for a graph and for a table; and that the script exits
+quietly when its terminal closes.
 """
 
 import fcntl
@@ -54,6 +57,9 @@ def handle(msg):
     if name == "list_datasources":
         out = [{"uid": "logs", "type": "loki"},
                {"uid": "prom1", "type": "prometheus", "isDefault": True}]
+    elif args.get("queryType") == "instant":
+        out = [{"metric": {"instance": f"host-{i}", "job": "node"},
+                "value": [time.time(), str(5 + 3 * i)]} for i in range(2)]
     else:
         start, end = (calendar.timegm(time.strptime(args[k], "%Y-%m-%dT%H:%M:%SZ"))
                       for k in ("startTime", "endTime"))
@@ -172,7 +178,7 @@ def problems_in(buf, deleted=True):
     return found
 
 
-def check_live(label, *args, stdin_data=None, want=None):
+def check_live(label, *args, stdin_data=None, want=None, seconds=2.5):
     master, slave = fake_terminal()
     proc = subprocess.Popen(
         [sys.executable, str(SCRIPT), "--tty", os.ttyname(slave), *args],
@@ -180,7 +186,7 @@ def check_live(label, *args, stdin_data=None, want=None):
     if stdin_data:
         proc.stdin.write(stdin_data)
         proc.stdin.flush()
-    buf = read_for(master, 2.5)
+    buf = read_for(master, seconds)
     proc.send_signal(signal.SIGTERM)
     deadline = time.monotonic() + 5
     while proc.poll() is None and time.monotonic() < deadline:
@@ -197,7 +203,7 @@ def check_live(label, *args, stdin_data=None, want=None):
         found.append(f"never sent {want!r}")
     if proc.returncode != 0:
         found.append(f"exit code {proc.returncode}: {err[-300:]}")
-    return report(label, found, f"{len(buf) / 2.5 / 1024:.0f} KB/s")
+    return report(label, found, f"{len(buf) / seconds / 1024:.0f} KB/s")
 
 
 def detached_id(result):
@@ -315,6 +321,28 @@ def check_snapshot(tmp):
     return report("--snapshot", found)
 
 
+def check_table_snapshot(tmp):
+    """--table reads text in columns (values with spaces in them included) and JSON."""
+    pods = ("NAME                  READY   STATUS             RESTARTS      AGE\n"
+            "api-7d9f8c6b5-x2kqp   1/1     Running            0             3d\n"
+            "api-7d9f8c6b5-m4n8z   0/1     CrashLoopBackOff   7 (40s ago)   12m\n"
+            "redis-0               1/1     Running            1 (2d ago)    9d\n")
+    text = Path(tmp) / "pods.txt"
+    text.write_text(pods)
+    found = []
+    for args, want in (
+            (["--cmd", f"cat '{text}'"], "3 rows, 5 columns"),
+            (["--cmd", "printf '{\"Names\":\"web\",\"Status\":\"Up 2 hours\"}\\n"
+                       "{\"Names\":\"db\",\"Status\":\"Exited (1) 3 days ago\"}\\n'"],
+             "2 rows, 2 columns"),
+            (["--cmd", f"cat '{text}'", "--columns", "status,name"], "3 rows, 2 columns")):
+        r = graph("--table", *args, "--snapshot", str(Path(tmp) / "table.png"))
+        if want not in r.stdout:
+            found.append(f"{args[-1][:40]!r}: wanted {want!r}, got "
+                         f"{(r.stdout + r.stderr).strip()[-300:]!r}")
+    return report("--table, text and JSON", found)
+
+
 def check_mcp(tmp):
     """--promql through a fake Grafana MCP server: started as a command, and over HTTP."""
     fake = Path(tmp) / "fake_mcp.py"
@@ -330,6 +358,13 @@ def check_mcp(tmp):
     if "2 series" not in r.stdout:
         found.append(f"didn't get the data: {(r.stdout + r.stderr).strip()[-300:]}")
     ok &= report("--mcp COMMAND", found)
+
+    found = []
+    r = graph("--promql", "up", "--table", "--mcp", command, "--snapshot",
+              str(Path(tmp) / "mcp-table.png"), env=env)
+    if "2 rows, 2 columns" not in r.stdout:  # instance and the value; job is the same
+        found.append(f"didn't get the rows: {(r.stdout + r.stderr).strip()[-300:]}")
+    ok &= report("--mcp, --table", found)
 
     # Started by a live graph, the server goes when the graph does.
     found = []
@@ -413,15 +448,26 @@ def report(label, problems, note=""):
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["XDG_RUNTIME_DIR"] = tmp  # a private list of running graphs
+        for k in ("SSH_CONNECTION", "SSH_TTY"):  # as if the terminal were this machine's
+            os.environ.pop(k, None)
         results = [
-            # want: the hidden placement that keeps the picture alive through `clear`
+            # want: the picture sent as a file, and the hidden placement that keeps it
+            # alive through `clear`
             check_live("--cmd", "--cmd", "echo 4.2", "--unit", "ms",
-                       want=rb"a=p,U=1,i=\d+,p=2,"),
+                       want=rb"a=T,f=100,[^;]*,t=t;.*a=p,U=1,i=\d+,p=2,"),
+            # A terminal that leaves the files alone (this fake one, or one over SSH)
+            # gets the pixels themselves after a few seconds.
+            check_live("can't read files", "--cmd", "echo 4.2",
+                       want=rb"a=T,f=100,[^;\x1b]*,q=2,m=[01];", seconds=7),
             check_live("--cmd, two series", "--cmd", "printf 'api 3\\nweb 7\\n'",
                        "--at", "bottom-left", "--size", "40x10"),
             check_live("--stdin", "--stdin", stdin_data=b"1\n2\n3\n"),
             check_live("--behind --at fill", "--cmd", "echo 3", "--behind", "--at", "fill",
                        want=rb"a=T,f=100,i=\d+,p=1,c=134,r=34,z=-1,"),
+            check_live("--table", "--table", "--cmd",
+                       "printf 'NAME   STATUS\\napi    Running\\nweb    Pending\\n'",
+                       want=rb"a=p,U=1,i=\d+,p=2,"),
+            check_table_snapshot(tmp),
             check_detach(),
             check_finds_terminal(tmp),
             check_replaces(),
