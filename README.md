@@ -19,5 +19,6 @@ Enjoy!
 |---|---|
 | [background](background/) | A slow animated plasma, marbled swirls that hold still, or a picture of your choice, behind the text in your terminal. It runs as an ordinary background job, needs no terminal config, and works over SSH. |
 | [graph](graph/) | A live line graph over a corner of your terminal: a Grafana or Prometheus query, any command that prints a number, or numbers on a pipe. Or a live table, like a `kubectl get pods` that lights up what changed. An agent like Claude Code can pop one up from its own shell. |
+| [picture](picture/) | A picture in a corner of your terminal: a file, which it watches for changes, or a URL, fetched again as often as you like. Animated GIFs play. An agent like Claude Code can pop one up to show you a chart it made. |
 
 MIT licensed; see [LICENSE](LICENSE).
